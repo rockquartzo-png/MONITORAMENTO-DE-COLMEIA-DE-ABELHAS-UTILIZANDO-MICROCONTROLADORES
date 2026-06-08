@@ -1,0 +1,343 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h> 
+#include <HTTPClient.h>       
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// ==========================
+// PINOS
+// ==========================
+
+#define DHTPIN      18
+#define DHTTYPE     DHT22
+
+#define LDR_PIN     4
+#define POT_PIN     5
+#define BUTTON_PIN  13
+
+#define SDA_LCD     21
+#define SCL_LCD     20
+
+// ==========================
+// OBJETOS
+// ==========================
+
+DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ==========================
+// CONFIGURAÇÃO DO SUPABASE
+// ==========================
+
+// Exemplo:
+// https://abc123xyz.supabase.co/rest/v1/colmeias
+const char* supabase_url = "COLE_AQUI_A_URL_DA_API_REST_DO_SUPABASE";
+
+// Exemplo:
+// eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+const char* supabase_key = "COLE_AQUI_A_CHAVE_ANON_DO_SUPABASE";
+
+// ==========================
+// WIFI WOKWI
+// ==========================
+
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+
+// ==========================
+// BATERIA VIRTUAL
+// ==========================
+
+const float POTENCIA_PAINEL = 60.0;
+const float CAPACIDADE_BATERIA = 480.0;
+
+float bateria = 240.0;
+
+bool bloqueioCarga = false;
+bool modoInspecao = false;
+
+// ==========================
+// PACOTE LORA VIRTUAL
+// ==========================
+
+struct PacoteLoRa {
+  float temperatura;
+  float umidade;
+  float frequencia; // Sem acento!
+  float lux;
+  float bateria;
+};
+
+PacoteLoRa pacote;
+
+// ==========================
+// HISTÓRICO
+// ==========================
+
+float histTemp[50];
+float histUmid[50];
+float histFreq[50];
+
+int indiceHist = 0;
+
+// ==========================
+
+String estadoAtual = "INICIANDO";
+
+unsigned long ultimoCiclo = 0;
+unsigned long intervaloLeitura = 15000;
+
+// ==========================
+
+float lerLux() {
+  int adc = analogRead(LDR_PIN);
+  return map(adc, 0, 4095, 0, 120000);
+}
+
+// ==========================
+
+float lerFrequencia() {
+  int adc = analogRead(POT_PIN);
+  return map(adc, 0, 4095, 50, 500);
+}
+
+// ==========================
+
+void atualizarBateria() {
+  float percentual = bateria / CAPACIDADE_BATERIA * 100.0;
+
+  if(percentual >= 95)
+    bloqueioCarga = true;
+
+  if(percentual <= 80)
+    bloqueioCarga = false;
+
+  if(!bloqueioCarga){
+    float ganho = ((pacote.lux / 1000.0) * POTENCIA_PAINEL) / 3600.0;
+    bateria += ganho * 5.0;
+  }
+
+  bateria -= 0.05;
+
+  bateria = constrain(bateria, 0, CAPACIDADE_BATERIA);
+}
+
+// ==========================
+
+void gerarPacoteLoRaVirtual() {
+  pacote.temperatura = dht.readTemperature();
+  pacote.umidade = dht.readHumidity();
+  pacote.frequencia = lerFrequencia();
+  pacote.lux = lerLux();
+
+  if(isnan(pacote.temperatura))
+    pacote.temperatura = 0;
+
+  if(isnan(pacote.umidade))
+    pacote.umidade = 0;
+
+  atualizarBateria();
+
+  pacote.bateria = bateria / CAPACIDADE_BATERIA * 100.0;
+}
+
+// ==========================
+
+void salvarHistorico() {
+  histTemp[indiceHist] = pacote.temperatura;
+  histUmid[indiceHist] = pacote.umidade;
+  histFreq[indiceHist] = pacote.frequencia;
+
+  indiceHist++;
+
+  if(indiceHist >= 50)
+    indiceHist = 0;
+}
+
+// ==========================
+
+float media(float v[]) {
+  float soma = 0;
+  for(int i=0;i<50;i++)
+    soma += v[i];
+  return soma / 50.0;
+}
+
+// ==========================
+
+String diagnostico() {
+  int score = 0;
+
+  if(pacote.temperatura >= 34 && pacote.temperatura <= 35)
+    score += 40;
+
+  if(pacote.umidade >= 60 && pacote.umidade <= 80)
+    score += 30;
+
+  if(pacote.frequencia >= 120 && pacote.frequencia <= 200)
+    score += 30;
+
+  if(pacote.temperatura > 38)
+    return "SUPERAQUECIMENTO";
+
+  if(pacote.temperatura < 30)
+    return "CRIA FRIA";
+
+  if(pacote.frequencia > 350 && pacote.temperatura < 35)
+    return "SEM RAINHA";
+
+  if(pacote.frequencia > 350 && pacote.temperatura > 35)
+    return "ENXAMEACAO";
+
+  if(score >= 80)
+    return "SAUDAVEL";
+
+  if(score >= 50)
+    return "ATENCAO";
+
+  return "CRITICA";
+}
+
+// ==========================
+
+void gatewayVirtual() {
+  estadoAtual = diagnostico();
+  salvarHistorico();
+
+  if(estadoAtual == "SAUDAVEL")
+    intervaloLeitura = 15000;
+  else if(estadoAtual == "ATENCAO")
+    intervaloLeitura = 5000;
+  else
+    intervaloLeitura = 2000;
+}
+
+// ==========================
+// FUNÇÃO DE ENVIO
+// ==========================
+void enviarParaSupabase() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    client.setInsecure(); 
+    
+    HTTPClient http;
+    http.begin(client, supabase_url);
+    
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("apikey", supabase_key);
+    http.addHeader("Authorization", String("Bearer ") + supabase_key);
+    
+    String json = "{";
+    json += "\"temperatura\":" + String(pacote.temperatura, 1) + ",";
+    json += "\"umidade\":" + String(pacote.umidade, 1) + ",";
+    json += "\"frequencia\":" + String(pacote.frequencia, 0) + ",";
+    json += "\"luminosidade\":" + String(pacote.lux, 0) + ",";
+    json += "\"bateria\":" + String(pacote.bateria, 0) + ",";
+    json += "\"estado\":\"" + estadoAtual + "\"";
+    json += "}";
+    
+    Serial.println("Tentando gravar no Supabase...");
+    
+    int httpResponseCode = http.POST(json);
+    
+    if (httpResponseCode == 201 || httpResponseCode == 200) {
+      Serial.print("Dado gravado na tabela colmeias. Codigo: ");
+      Serial.println(httpResponseCode);
+    } 
+    else {
+      Serial.print("⚠️ REJEITADO PELO SUPABASE! Codigo HTTP: ");
+      Serial.println(httpResponseCode);
+      
+      String respostaErro = http.getString();
+      Serial.print("Motivo do banco de dados: ");
+      Serial.println(respostaErro);
+    }
+    
+    http.end(); 
+  } else {
+    Serial.println("Erro: Wi-Fi desconectado.");
+  }
+}
+
+// ==========================
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin(SDA_LCD, SCL_LCD);
+
+  lcd.init();
+  lcd.backlight();
+
+  dht.begin();
+
+  WiFi.begin(ssid, password);
+
+  lcd.clear();
+  lcd.print("Conectando Wi-Fi");
+
+  while(WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Conectado! IP do Wokwi: ");
+  Serial.println(WiFi.localIP());
+
+  lcd.clear();
+}
+
+// ==========================
+
+void loop() {
+  if(!digitalRead(BUTTON_PIN)) {
+    modoInspecao = !modoInspecao;
+    delay(300);
+  }
+
+  unsigned long agora = millis();
+
+  if(agora - ultimoCiclo >= intervaloLeitura) {
+    ultimoCiclo = agora;
+
+    generatePacoteLoRaVirtual(); 
+    gerarPacoteLoRaVirtual();
+    gatewayVirtual();
+    
+    enviarParaSupabase();
+
+    lcd.clear();
+
+    lcd.setCursor(0,0);
+    lcd.print(
+      String((int)pacote.temperatura)
+      + "C "
+      + String((int)pacote.bateria)
+      + "%"
+    );
+
+    lcd.setCursor(0,1);
+
+    String txt = estadoAtual;
+
+    if(txt.length() > 16)
+      txt = txt.substring(0,16);
+
+    lcd.print(txt);
+
+    Serial.println("========");
+    Serial.println(estadoAtual);
+    Serial.print("Temp: ");   Serial.println(pacote.temperatura);
+    Serial.print("Umid: ");   Serial.println(pacote.umidade);
+    Serial.print("Freq: ");   Serial.println(pacote.frequencia);
+    Serial.print("Lux: ");    Serial.println(pacote.lux);
+    Serial.print("Bat: ");    Serial.println(pacote.bateria);
+  }
+}
+
+void generatePacoteLoRaVirtual() {}
